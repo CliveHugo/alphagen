@@ -1,11 +1,11 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
 from .linear_alpha_pool import MseAlphaPool
-from ..data.calculator import AlphaCalculator
+from ..data.calculator import AlphaCalculator, TensorAlphaCalculator
 from ..data.expression import Expression, OutOfDataRangeError
 
 
@@ -122,7 +122,8 @@ class ShadowMseAlphaPool(MseAlphaPool):
         shadow_capacity: int = 200,
         shadow_export_top_k: Optional[int] = None,
         shadow_rank_exact_top_n: Optional[int] = None,
-        shadow_refit: bool = False
+        shadow_refit: bool = False,
+        shadow_rank_batch_size: int = 16
     ):
         super().__init__(
             capacity=capacity,
@@ -137,6 +138,7 @@ class ShadowMseAlphaPool(MseAlphaPool):
             shadow_capacity if shadow_rank_exact_top_n is None else shadow_rank_exact_top_n
         )
         self.shadow_refit = shadow_refit
+        self.shadow_rank_batch_size = shadow_rank_batch_size
 
     def _on_alpha_evicted(
         self,
@@ -153,6 +155,42 @@ class ShadowMseAlphaPool(MseAlphaPool):
             reason=reason
         )
 
+    def _calc_ics(
+        self,
+        expr: Expression,
+        ic_mut_threshold: Optional[float] = None
+    ) -> Tuple[float, Optional[List[float]]]:
+        if not isinstance(self.calculator, TensorAlphaCalculator):
+            return super()._calc_ics(expr, ic_mut_threshold)
+
+        calculator = self.calculator
+        try:
+            value = calculator.evaluate_alpha(expr)
+            target = calculator.target.to(device=value.device, dtype=value.dtype)
+            if self._contains_nan(value, target):
+                return super()._calc_ics(expr, ic_mut_threshold)
+
+            single_ic = float(self._mean_daily_pearson_to_target_no_nan(value[None, :, :], target)[0].item())
+            if not self._under_thres_alpha and single_ic < self._ic_lower_bound:
+                return single_ic, None
+
+            if self.size == 0:
+                return single_ic, []
+
+            active_values = self._evaluate_active_values(self._active_exprs(), calculator, value[None, :, :])
+            if self._contains_nan(active_values):
+                return super()._calc_ics(expr, ic_mut_threshold)
+
+            mutual_ics = self._mean_daily_pearson_pairwise_no_nan(
+                value[None, :, :],
+                active_values
+            )[0]
+            if ic_mut_threshold is not None and (mutual_ics > ic_mut_threshold).any().item():
+                return single_ic, None
+            return single_ic, [float(value) for value in mutual_ics.detach().cpu().numpy()]
+        except (TypeError, ValueError):
+            return super()._calc_ics(expr, ic_mut_threshold)
+
     def rank_shadow(self, exact_top_n: Optional[int] = None) -> List[ShadowAlphaRecord]:
         active_keys = {str(expr) for expr in self.exprs[:self.size] if expr is not None}
         records = [
@@ -162,9 +200,18 @@ class ShadowMseAlphaPool(MseAlphaPool):
         if len(records) == 0:
             return []
 
-        active_exprs: List[Expression] = [
-            expr for expr in self.exprs[:self.size] if expr is not None
-        ]
+        if isinstance(self.calculator, TensorAlphaCalculator):
+            return self._rank_shadow_tensor(records, exact_top_n)
+
+        return self._rank_shadow_generic(records, exact_top_n)
+
+    def _rank_shadow_generic(
+        self,
+        records: List[ShadowAlphaRecord],
+        exact_top_n: Optional[int]
+    ) -> List[ShadowAlphaRecord]:
+        active_exprs = self._active_exprs()
+
         for record in records:
             self._estimate_shadow_record(record, active_exprs)
 
@@ -180,6 +227,107 @@ class ShadowMseAlphaPool(MseAlphaPool):
         self.shadow_pool.trim()
         records.sort(key=self._shadow_sort_key, reverse=True)
         return records
+
+    def _rank_shadow_tensor(
+        self,
+        records: List[ShadowAlphaRecord],
+        exact_top_n: Optional[int]
+    ) -> List[ShadowAlphaRecord]:
+        calculator = self.calculator
+        assert isinstance(calculator, TensorAlphaCalculator)
+
+        active_exprs = self._active_exprs()
+        target = calculator.target
+        active_values = self._evaluate_active_values(active_exprs, calculator, target[None, :, :])
+        target = target.to(device=active_values.device, dtype=active_values.dtype)
+        if self._contains_nan(active_values, target):
+            return self._rank_shadow_generic(records, exact_top_n)
+
+        with torch.no_grad():
+            if len(active_exprs) == 0:
+                base_value = torch.zeros_like(target)
+                base_ic = 0.
+            else:
+                active_weights = torch.tensor(
+                    self.weights,
+                    device=active_values.device,
+                    dtype=active_values.dtype
+                )
+                base_value = (active_weights[:, None, None] * active_values).sum(dim=0)
+                base_ic = self._mean_daily_pearson_to_target_no_nan(
+                    base_value[None, :, :],
+                    target
+                )[0].item()
+
+            valid_records = []
+            for record_chunk, shadow_values in self._iter_shadow_value_chunks(records, calculator, target):
+                if self._contains_nan(shadow_values):
+                    return self._rank_shadow_generic(records, exact_top_n)
+                valid_records.extend(record_chunk)
+                if len(active_exprs) == 0:
+                    mutual_ics = torch.empty(
+                        (len(record_chunk), 0),
+                        device=shadow_values.device,
+                        dtype=shadow_values.dtype
+                    )
+                    residual_ics = torch.tensor(
+                        [record.single_ic for record in record_chunk],
+                        device=shadow_values.device,
+                        dtype=shadow_values.dtype
+                    )
+                else:
+                    mutual_ics = self._mean_daily_pearson_pairwise_no_nan(
+                        shadow_values,
+                        active_values
+                    )
+                    single_ics = torch.tensor(
+                        [record.single_ic for record in record_chunk],
+                        device=shadow_values.device,
+                        dtype=shadow_values.dtype
+                    )
+                    residual_ics = single_ics - mutual_ics.matmul(active_weights)
+
+                mutual_np = mutual_ics.detach().cpu().numpy()
+                residual_np = residual_ics.detach().cpu().numpy()
+                for i, record in enumerate(record_chunk):
+                    residual_ic = float(residual_np[i])
+                    record.delta_ic = None
+                    record.exact_evaluated = False
+                    record.last_error = None
+                    record.approx_score = abs(residual_ic)
+                    record.suggested_weight = residual_ic
+                    record.active_mutual_ics = [float(value) for value in mutual_np[i]]
+
+            if len(valid_records) == 0:
+                return []
+
+            valid_records.sort(key=self._shadow_sort_key, reverse=True)
+            if exact_top_n is None:
+                exact_top_n = self.shadow_rank_exact_top_n
+            exact_top_n = max(0, min(exact_top_n, len(valid_records)))
+
+            if self.shadow_refit:
+                for record in valid_records[:exact_top_n]:
+                    self._evaluate_shadow_delta(record, active_exprs, base_ic)
+            elif exact_top_n > 0:
+                exact_records = valid_records[:exact_top_n]
+                for record_chunk, shadow_values in self._iter_shadow_value_chunks(exact_records, calculator, target):
+                    selected_weights = torch.tensor(
+                        [record.suggested_weight for record in record_chunk],
+                        device=shadow_values.device,
+                        dtype=shadow_values.dtype
+                    )
+                    candidate_values = base_value[None, :, :] + selected_weights[:, None, None] * shadow_values
+                    new_ics = self._mean_daily_pearson_to_target_no_nan(candidate_values, target)
+                    deltas = (new_ics - base_ic).detach().cpu().numpy()
+                    for record, delta_ic in zip(record_chunk, deltas):
+                        record.delta_ic = float(delta_ic)
+                        record.exact_evaluated = True
+                        record.last_error = None
+
+        self.shadow_pool.trim()
+        valid_records.sort(key=self._shadow_sort_key, reverse=True)
+        return valid_records
 
     def _estimate_shadow_record(
         self,
@@ -262,6 +410,123 @@ class ShadowMseAlphaPool(MseAlphaPool):
             record.exact_evaluated = False
             record.last_error = f"{type(exc).__name__}: {exc}"
 
+    def _active_exprs(self) -> List[Expression]:
+        return [
+            expr for expr in self.exprs[:self.size] if expr is not None
+        ]
+
+    def _evaluate_shadow_values(
+        self,
+        records: List[ShadowAlphaRecord],
+        calculator: TensorAlphaCalculator
+    ) -> Tuple[List[ShadowAlphaRecord], torch.Tensor]:
+        valid_records = []
+        values = []
+        for record in records:
+            try:
+                values.append(calculator.evaluate_alpha(record.expr))
+                valid_records.append(record)
+            except (OutOfDataRangeError, TypeError, ValueError, RuntimeError) as exc:
+                record.approx_score = float("-inf")
+                record.suggested_weight = 0.
+                record.delta_ic = None
+                record.exact_evaluated = False
+                record.last_error = f"{type(exc).__name__}: {exc}"
+                record.active_mutual_ics = None
+
+        if len(values) == 0:
+            return [], torch.empty(0, device=self.device)
+        return valid_records, torch.stack(values)
+
+    def _evaluate_active_values(
+        self,
+        active_exprs: List[Expression],
+        calculator: TensorAlphaCalculator,
+        shadow_values: torch.Tensor
+    ) -> torch.Tensor:
+        if len(active_exprs) == 0:
+            return torch.empty(
+                (0, *shadow_values.shape[1:]),
+                device=shadow_values.device,
+                dtype=shadow_values.dtype
+            )
+        return torch.stack([
+            calculator.evaluate_alpha(expr).to(device=shadow_values.device, dtype=shadow_values.dtype)
+            for expr in active_exprs
+        ])
+
+    def _iter_shadow_value_chunks(
+        self,
+        records: List[ShadowAlphaRecord],
+        calculator: TensorAlphaCalculator,
+        reference: torch.Tensor
+    ):
+        batch_size = max(1, self.shadow_rank_batch_size)
+        for start in range(0, len(records), batch_size):
+            record_chunk = records[start:start + batch_size]
+            valid_records, values = self._evaluate_shadow_values(record_chunk, calculator)
+            if len(valid_records) == 0:
+                continue
+            yield (
+                valid_records,
+                values.to(device=reference.device, dtype=reference.dtype)
+            )
+
+    def _contains_nan(self, *values: torch.Tensor) -> bool:
+        return any(value.numel() > 0 and torch.isnan(value).any().item() for value in values)
+
+    def _mean_daily_pearson_pairwise_no_nan(
+        self,
+        xs: torch.Tensor,
+        ys: torch.Tensor,
+        chunk_size: int = 16
+    ) -> torch.Tensor:
+        if ys.shape[0] == 0:
+            return torch.empty((xs.shape[0], 0), device=xs.device, dtype=xs.dtype)
+
+        n_stocks = xs.shape[-1]
+        y_mean = ys.mean(dim=2)
+        y_std = ((ys - y_mean[:, :, None]) ** 2).mean(dim=2).sqrt()
+        outputs = []
+        for start in range(0, xs.shape[0], chunk_size):
+            chunk = xs[start:start + chunk_size]
+            x_mean = chunk.mean(dim=2)
+            x_std = ((chunk - x_mean[:, :, None]) ** 2).mean(dim=2).sqrt()
+            prod_mean = torch.einsum("sdn,adn->sad", chunk, ys) / n_stocks
+            cov = prod_mean - x_mean[:, None, :] * y_mean[None, :, :]
+            stdmul = x_std[:, None, :] * y_std[None, :, :]
+            stdmul = torch.where(
+                (x_std[:, None, :] < 1e-3) | (y_std[None, :, :] < 1e-3),
+                torch.ones_like(stdmul),
+                stdmul
+            )
+            outputs.append((cov / stdmul).mean(dim=2))
+        return torch.cat(outputs, dim=0)
+
+    def _mean_daily_pearson_to_target_no_nan(
+        self,
+        xs: torch.Tensor,
+        target: torch.Tensor,
+        chunk_size: int = 32
+    ) -> torch.Tensor:
+        y_mean = target.mean(dim=1)
+        y_std = ((target - y_mean[:, None]) ** 2).mean(dim=1).sqrt()
+        outputs = []
+        for start in range(0, xs.shape[0], chunk_size):
+            chunk = xs[start:start + chunk_size]
+            x_mean = chunk.mean(dim=2)
+            x_std = ((chunk - x_mean[:, :, None]) ** 2).mean(dim=2).sqrt()
+            prod_mean = (chunk * target[None, :, :]).mean(dim=2)
+            cov = prod_mean - x_mean * y_mean[None, :]
+            stdmul = x_std * y_std[None, :]
+            stdmul = torch.where(
+                (x_std < 1e-3) | (y_std[None, :] < 1e-3),
+                torch.ones_like(stdmul),
+                stdmul
+            )
+            outputs.append((cov / stdmul).mean(dim=1))
+        return torch.cat(outputs, dim=0)
+
     def _calc_shadow_mutual_ics(
         self,
         record: ShadowAlphaRecord,
@@ -331,6 +596,7 @@ class ShadowMseAlphaPool(MseAlphaPool):
                 "shadow_export_top_k": self.shadow_export_top_k,
                 "shadow_rank_exact_top_n": self.shadow_rank_exact_top_n,
                 "shadow_refit": self.shadow_refit,
+                "shadow_rank_batch_size": self.shadow_rank_batch_size,
             }
         })
         return raw

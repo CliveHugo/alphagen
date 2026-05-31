@@ -170,7 +170,8 @@ def run_single_experiment(
     shadow_capacity: int = 200,
     shadow_export_top_k: Optional[int] = 200,
     shadow_rank_exact_top_n: Optional[int] = None,
-    shadow_refit: bool = False
+    shadow_refit: bool = False,
+    shadow_rank_batch_size: int = 16
 ):
     reseed_everything(seed)
     initialize_qlib("~/.qlib/qlib_data/cn_data")
@@ -190,7 +191,8 @@ def run_single_experiment(
     Shadow capacity: {shadow_capacity}
     Shadow export top K: {shadow_export_top_k}
     Shadow exact rank top N: {shadow_rank_exact_top_n}
-    Shadow refit active weights: {shadow_refit}""")
+    Shadow refit active weights: {shadow_refit}
+    Shadow rank batch size: {shadow_rank_batch_size}""")
 
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     # tag = "rlv2" if llm_add_subexpr == 0 else f"afs{llm_add_subexpr}aar1-5"
@@ -234,7 +236,8 @@ def run_single_experiment(
                 shadow_capacity=shadow_capacity,
                 shadow_export_top_k=shadow_export_top_k,
                 shadow_rank_exact_top_n=shadow_rank_exact_top_n,
-                shadow_refit=shadow_refit
+                shadow_refit=shadow_refit,
+                shadow_rank_batch_size=shadow_rank_batch_size
             )
         else:
             pool = MseAlphaPool(
@@ -312,7 +315,8 @@ def main(
     shadow_capacity: int = 200,
     shadow_export_top_k: Optional[int] = 200,
     shadow_rank_exact_top_n: Optional[int] = None,
-    shadow_refit: bool = False
+    shadow_refit: bool = False,
+    shadow_rank_batch_size: int = 16
 ):
     """
     :param random_seeds: Random seeds
@@ -328,6 +332,7 @@ def main(
     :param shadow_export_top_k: Total ranked alphas to export, active plus shadow
     :param shadow_rank_exact_top_n: Number of shadow alphas to score by exact delta(IC)
     :param shadow_refit: Refit active plus shadow weights when scoring each shadow alpha
+    :param shadow_rank_batch_size: Number of shadow alphas scored together per tensor batch
     """
     if isinstance(random_seeds, int):
         random_seeds = (random_seeds, )
@@ -351,7 +356,8 @@ def main(
             shadow_capacity=shadow_capacity,
             shadow_export_top_k=shadow_export_top_k,
             shadow_rank_exact_top_n=shadow_rank_exact_top_n,
-            shadow_refit=shadow_refit
+            shadow_refit=shadow_refit,
+            shadow_rank_batch_size=shadow_rank_batch_size
         )
 
 
