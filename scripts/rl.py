@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 from datetime import datetime
 from pathlib import Path
 from openai import OpenAI
@@ -13,6 +13,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from alphagen.data.expression import *
 from alphagen.data.parser import ExpressionParser
 from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool
+from alphagen.models.shadow_alpha_pool import ShadowMseAlphaPool
 from alphagen.rl.env.wrapper import AlphaEnv
 from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
@@ -140,7 +141,7 @@ class CustomCallback(BaseCallback):
         try:
             remain_n = max(0, self.pool.size - self._drop_rl_n)
             remain = self.pool.most_significant_indices(remain_n)
-            self.pool.leave_only(remain)
+            self.pool.leave_only(remain, eviction_reason="llm_drop")
             self.chat_session.update_pool(self.pool)
         except Exception as e:
             logger.warning(f"LLM invocation failed due to {type(e)}: {str(e)}")
@@ -164,7 +165,12 @@ def run_single_experiment(
     use_llm: bool = False,
     llm_every_n_steps: int = 25_000,
     drop_rl_n: int = 5,
-    llm_replace_n: int = 3
+    llm_replace_n: int = 3,
+    use_shadow_pool: bool = False,
+    shadow_capacity: int = 200,
+    shadow_export_top_k: Optional[int] = 200,
+    shadow_rank_exact_top_n: Optional[int] = None,
+    shadow_refit: bool = False
 ):
     reseed_everything(seed)
     initialize_qlib("~/.qlib/qlib_data/cn_data")
@@ -179,7 +185,12 @@ def run_single_experiment(
     Use LLM: {use_llm}
     Invoke LLM every N steps: {llm_every_n_steps}
     Replace N alphas with LLM: {llm_replace_n}
-    Drop N alphas before LLM: {drop_rl_n}""")
+    Drop N alphas before LLM: {drop_rl_n}
+    Use shadow pool: {use_shadow_pool}
+    Shadow capacity: {shadow_capacity}
+    Shadow export top K: {shadow_export_top_k}
+    Shadow exact rank top N: {shadow_rank_exact_top_n}
+    Shadow refit active weights: {shadow_refit}""")
 
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     # tag = "rlv2" if llm_add_subexpr == 0 else f"afs{llm_add_subexpr}aar1-5"
@@ -213,13 +224,26 @@ def run_single_experiment(
     calculators = [QLibStockDataCalculator(d, target) for d in datasets]
 
     def build_pool(exprs: List[Expression]) -> LinearAlphaPool:
-        pool = MseAlphaPool(
-            capacity=pool_capacity,
-            calculator=calculators[0],
-            ic_lower_bound=None,
-            l1_alpha=5e-3,
-            device=device
-        )
+        if use_shadow_pool:
+            pool = ShadowMseAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=5e-3,
+                device=device,
+                shadow_capacity=shadow_capacity,
+                shadow_export_top_k=shadow_export_top_k,
+                shadow_rank_exact_top_n=shadow_rank_exact_top_n,
+                shadow_refit=shadow_refit
+            )
+        else:
+            pool = MseAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=5e-3,
+                device=device
+            )
         if len(exprs) != 0:
             pool.force_load_exprs(exprs)
         return pool
@@ -283,7 +307,12 @@ def main(
     use_llm: bool = False,
     drop_rl_n: int = 10,
     steps: Optional[int] = None,
-    llm_every_n_steps: int = 25000
+    llm_every_n_steps: int = 25000,
+    use_shadow_pool: bool = False,
+    shadow_capacity: int = 200,
+    shadow_export_top_k: Optional[int] = 200,
+    shadow_rank_exact_top_n: Optional[int] = None,
+    shadow_refit: bool = False
 ):
     """
     :param random_seeds: Random seeds
@@ -294,6 +323,11 @@ def main(
     :param drop_rl_n: Drop n worst alphas before invoke the LLM
     :param steps: Total iteration steps
     :param llm_every_n_steps: Invoke LLM every n steps
+    :param use_shadow_pool: Enable a shadow pool for evicted alphas
+    :param shadow_capacity: Maximum number of evicted alphas cached in the shadow pool
+    :param shadow_export_top_k: Total ranked alphas to export, active plus shadow
+    :param shadow_rank_exact_top_n: Number of shadow alphas to score by exact delta(IC)
+    :param shadow_refit: Refit active plus shadow weights when scoring each shadow alpha
     """
     if isinstance(random_seeds, int):
         random_seeds = (random_seeds, )
@@ -312,7 +346,12 @@ def main(
             alphagpt_init=alphagpt_init,
             drop_rl_n=drop_rl_n,
             use_llm=use_llm,
-            llm_every_n_steps=llm_every_n_steps
+            llm_every_n_steps=llm_every_n_steps,
+            use_shadow_pool=use_shadow_pool,
+            shadow_capacity=shadow_capacity,
+            shadow_export_top_k=shadow_export_top_k,
+            shadow_rank_exact_top_n=shadow_rank_exact_top_n,
+            shadow_refit=shadow_refit
         )
 
 

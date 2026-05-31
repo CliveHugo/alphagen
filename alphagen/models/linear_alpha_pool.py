@@ -58,6 +58,15 @@ class LinearAlphaPool(AlphaPoolBase, metaclass=ABCMeta):
             "weights": list(self.weights)
         }
 
+    def _on_alpha_evicted(
+        self,
+        expr: Expression,
+        weight: float,
+        single_ic: float,
+        reason: str
+    ) -> None:
+        "Hook for subclasses that need to observe alphas leaving the active pool."
+
     def try_new_expr(self, expr: Expression) -> float:
         ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=0.99)
         if ic_ret is None or ic_mut is None or np.isnan(ic_ret) or np.isnan(ic_mut).any():
@@ -88,6 +97,7 @@ class LinearAlphaPool(AlphaPoolBase, metaclass=ABCMeta):
                 new_pool_ic=ic_ret
             ))
             if worst_idx is not None:
+                self._notify_alpha_evicted(worst_idx, "capacity")
                 self._pop(worst_idx)
         else:
             self.update_history.append(AddRemoveAlphas(
@@ -216,16 +226,31 @@ class LinearAlphaPool(AlphaPoolBase, metaclass=ABCMeta):
         self._swap_idx(index, self.capacity)
         self.size = self.capacity
 
+    def _notify_alpha_evicted(self, index: int, reason: str) -> None:
+        expr = self.exprs[index]
+        if expr is None:
+            return
+        self._on_alpha_evicted(
+            expr=expr,
+            weight=float(self._weights[index]),
+            single_ic=float(self.single_ics[index]),
+            reason=reason
+        )
+
     def most_significant_indices(self, k: int) -> List[int]:
         if self.size == 0:
             return []
         ranks = (-np.abs(self.weights)).argsort().argsort()
         return [i for i in range(self.size) if ranks[i] < k]
 
-    def leave_only(self, indices: Iterable[int]) -> None:
+    def leave_only(self, indices: Iterable[int], eviction_reason: str = "leave_only") -> None:
         "Leaves only the alphas at the given indices intact, and removes all others."
         self._failure_cache = set()
         indices = sorted(indices)
+        kept = set(indices)
+        for i in range(self.size):
+            if i not in kept:
+                self._notify_alpha_evicted(i, eviction_reason)
         for i, j in enumerate(indices):
             self._swap_idx(i, j)
         self.size = len(indices)
@@ -238,7 +263,7 @@ class LinearAlphaPool(AlphaPoolBase, metaclass=ABCMeta):
         remain = [i for i in range(self.size) if i not in removed_indices]
         old_exprs = {id(self.exprs[i]): i for i in range(self.size)}
         old_update_history_count = len(self.update_history)
-        self.leave_only(remain)
+        self.leave_only(remain, eviction_reason="bulk_edit")
         for e in added_exprs:
             self.try_new_expr(e)
         self.update_history = self.update_history[:old_update_history_count]
@@ -283,13 +308,31 @@ class MseAlphaPool(LinearAlphaPool):
         self._l1_alpha = l1_alpha
 
     def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:
+        return self._optimize_weights_from_stats(
+            self.single_ics[:self.size],
+            self._mutual_ics[:self.size, :self.size],
+            self.weights,
+            lr=lr,
+            max_steps=max_steps,
+            tolerance=tolerance
+        )
+
+    def _optimize_weights_from_stats(
+        self,
+        single_ics: np.ndarray,
+        mutual_ics: np.ndarray,
+        initial_weights: np.ndarray,
+        lr: float = 5e-4,
+        max_steps: int = 10000,
+        tolerance: int = 500
+    ) -> np.ndarray:
         alpha = self._l1_alpha
         if math.isclose(alpha, 0.):     # No L1 regularization, use the faster least-squares method
-            return self._optimize_lstsq()
+            return self._optimize_lstsq_from_stats(mutual_ics, single_ics, initial_weights)
             
-        ics_ret = torch.tensor(self.single_ics[:self.size], device=self.device)
-        ics_mut = torch.tensor(self._mutual_ics[:self.size, :self.size], device=self.device)
-        weights = torch.tensor(self.weights, device=self.device, requires_grad=True)
+        ics_ret = torch.tensor(single_ics, device=self.device)
+        ics_mut = torch.tensor(mutual_ics, device=self.device)
+        weights = torch.tensor(initial_weights, device=self.device, requires_grad=True)
         optim = torch.optim.Adam([weights], lr=lr)
     
         loss_ic_min = float("inf")
@@ -323,10 +366,22 @@ class MseAlphaPool(LinearAlphaPool):
         return best_weights.cpu().detach().numpy()
     
     def _optimize_lstsq(self) -> np.ndarray:
+        return self._optimize_lstsq_from_stats(
+            self._mutual_ics[:self.size, :self.size],
+            self.single_ics[:self.size],
+            self.weights
+        )
+
+    def _optimize_lstsq_from_stats(
+        self,
+        mutual_ics: np.ndarray,
+        single_ics: np.ndarray,
+        fallback_weights: np.ndarray
+    ) -> np.ndarray:
         try:
-            return np.linalg.lstsq(self._mutual_ics[:self.size, :self.size],self.single_ics[:self.size])[0]
+            return np.linalg.lstsq(mutual_ics, single_ics, rcond=-1)[0]
         except (np.linalg.LinAlgError, ValueError):
-            return self.weights
+            return fallback_weights
 
 
 # Note: Currently the weights are only updated when the new IC is higher.
